@@ -40,7 +40,7 @@ only `curl`, `xmllint`, and `awk`, all of which are preinstalled on macOS.
 (On Debian/Ubuntu: `apt install curl libxml2-utils` — `awk` is already present.)
 
 ```bash
-git clone https://github.com/<you>/clayok.git
+git clone https://github.com/mdlarson/clayok.git
 cd clayok
 chmod +x clayok
 
