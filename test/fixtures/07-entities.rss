@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Clay - Incident History</title>
+    <item>
+      <title><![CDATA[Ads & "Meta" <integration> issues]]></title>
+      <description><![CDATA[[Resolved] Resolved the R&D issue with "quoted" text.]]></description>
+      <pubDate>Sat, 25 Jul 2026 18:00:00 -0700</pubDate>
+      <link>https://status.clay.com/incidents/ent</link>
+    </item>
+  </channel>
+</rss>

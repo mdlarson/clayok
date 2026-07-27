@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Clay - Incident History</title>
+    <item>
+      <title><![CDATA[Normal Resolved Incident]]></title>
+      <description><![CDATA[[Resolved] All good.]]></description>
+      <pubDate>Wed, 01 Jan 2025 00:00:00 -0700</pubDate>
+      <link>https://status.clay.com/incidents/ok</link>
+    </item>
+    <item>
+      <title><![CDATA[Something With A Novel Status]]></title>
+      <description><![CDATA[[Frobnicating] This status token is not in our vocabulary.]]></description>
+      <pubDate>Sat, 25 Jul 2026 18:00:00 -0700</pubDate>
+      <link>https://status.clay.com/incidents/frob</link>
+    </item>
+  </channel>
+</rss>

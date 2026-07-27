@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+#
+# clayok — check Clay's status (https://status.clay.com) from the terminal.
+#
+# Inspired by dacharyc/clok (an Anthropic-status checker). Clay's status page
+# runs on Rootly, which exposes no JSON API, so this reads the public RSS
+# incident feed instead and derives current status from it.
+#
+# Dependencies: curl + xmllint + awk (all preinstalled on macOS). Targets Bash 3.2.
+#
+# Exit codes:
+#   0  operational  — no active incidents found in the feed
+#   1  active       — an incident or maintenance is currently in progress
+#   2  unknown      — could not fetch/parse the feed, or status is indeterminate
+#
+set -euo pipefail
+shopt -s nocasematch   # case-insensitive `case` matching, fork-free
+
+VERSION="1.0.0"
+DEFAULT_URL="https://status.clay.com/history.rss"
+UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+LIMIT=5
+MAX_LIMIT=50
+
+# One-pass RSS parser. Walks <item>…</item> blocks and prints, per item, a
+# single tab-separated line: "TOKEN<TAB>TITLE<TAB>PUBDATE<TAB>LINK", where
+# TOKEN is the leading [Status] of the description body ("" if none). Doing all
+# extraction in a single awk process (instead of one xmllint call per item)
+# keeps a 100+ item feed at a few milliseconds. Item boundaries are tracked
+# explicitly, so a missing field yields "" for that item without misaligning
+# the others.
+AWK_PARSE='
+function field(buf, tag,   o, c, rest, s, start, endp) {
+  o = "<" tag ">"; c = "</" tag ">"
+  start = index(buf, o); if (start == 0) return ""
+  rest = substr(buf, start + length(o))
+  endp = index(rest, c); if (endp == 0) return ""
+  s = substr(rest, 1, endp - 1)
+  gsub(/^[ \t]+|[ \t]+$/, "", s)                       # trim
+  if (s ~ /^<!\[CDATA\[/ && s ~ /\]\]>$/) s = substr(s, 10, length(s) - 12)  # unwrap CDATA
+  gsub(/^[ \t]+|[ \t]+$/, "", s)
+  return s
+}
+{
+  if ($0 ~ /<item>/) { initem = 1; buf = "" }
+  if (initem) buf = buf " " $0
+  if ($0 ~ /<\/item>/) {
+    initem = 0
+    d = field(buf, "description"); t = field(buf, "title")
+    p = field(buf, "pubDate");     l = field(buf, "link")
+    tok = ""
+    if (d ~ /^\[[^]]*\]/) tok = substr(d, 2, index(d, "]") - 2)
+    print tok "\t" t "\t" p "\t" l
+  }
+}
+'
+
+# --- small helpers ---------------------------------------------------------
+
+warn() { printf '%s\n' "$*" >&2; }
+die()  { local code="$1"; shift; printf '%s\n' "$*" >&2; exit "$code"; }
+
+usage() {
+  cat <<EOF
+clayok $VERSION — check Clay's status from the terminal
+
+USAGE:
+  clayok [-n N] [--help] [--version]
+
+OPTIONS:
+  -n, --limit N   Number of recent incidents to list (default 5, max $MAX_LIMIT)
+  -h, --help      Show this help and exit
+  -v, --version   Show version and exit
+
+EXIT CODES:
+  0  operational  — no active incidents found in the feed
+  1  active       — an incident or maintenance is currently in progress
+  2  unknown      — could not fetch/parse the feed, or status is indeterminate
+
+ENVIRONMENT:
+  CLAYOK_FEED     Override the feed source (a URL or a local file path).
+                  Handy for testing offline against a saved feed.
+
+NOTES:
+  Status is derived from Clay's public RSS incident feed
+  ($DEFAULT_URL). The feed is incident history, not an
+  authoritative component-status API, so "operational" means "no active
+  incidents found in the feed", not a guarantee that every system is healthy.
+EOF
+}
+
+# Set the global ICON for a status token (lifecycle-based; no impact scale).
+ICON=""
+icon_for() {
+  case "$1" in
+    resolved|completed)                 ICON='✅' ;;
+    monitoring|verifying)               ICON='🟡' ;;
+    identified|"in progress"|scheduled) ICON='🟠' ;;
+    investigating)                      ICON='🔴' ;;
+    *)                                  ICON='❔' ;;
+  esac
+}
+
+# --- date helpers ----------------------------------------------------------
+
+# Format an RFC-822 pubDate as YYYY-MM-DD, fork-free (falls back to raw input).
+fmt_date() {
+  local s="$1" dow day mon yr rest
+  read -r dow day mon yr rest <<< "$s"
+  case "$mon" in
+    Jan) mon=01 ;; Feb) mon=02 ;; Mar) mon=03 ;; Apr) mon=04 ;;
+    May) mon=05 ;; Jun) mon=06 ;; Jul) mon=07 ;; Aug) mon=08 ;;
+    Sep) mon=09 ;; Oct) mon=10 ;; Nov) mon=11 ;; Dec) mon=12 ;;
+    *) printf '%s' "$s"; return ;;
+  esac
+  case "$day" in ''|*[!0-9]*) printf '%s' "$s"; return ;; ?) day="0$day" ;; esac
+  case "$yr"  in ''|*[!0-9]*) printf '%s' "$s"; return ;; esac
+  printf '%s-%s-%s' "$yr" "$mon" "$day"
+}
+
+# Convert an RFC-822 pubDate to a Unix epoch (BSD or GNU date). "" on failure.
+to_epoch() {
+  local s="$1" e=""
+  e="$(date -j -f "%a, %d %b %Y %H:%M:%S %z" "$s" +%s 2>/dev/null)" || \
+  e="$(date -d "$s" +%s 2>/dev/null)" || e=""
+  printf '%s' "$e"
+}
+
+# --- feed access -----------------------------------------------------------
+
+FEED_FILE=""
+ERR_FILE=""
+cleanup() { [ -n "$FEED_FILE" ] && rm -f "$FEED_FILE" "$ERR_FILE" 2>/dev/null || true; }
+
+check_deps() {
+  command -v xmllint >/dev/null 2>&1 || \
+    die 2 "clayok: 'xmllint' not found. Install libxml2 (preinstalled on macOS; 'apt install libxml2-utils' on Debian/Ubuntu)."
+  command -v awk >/dev/null 2>&1 || die 2 "clayok: 'awk' not found."
+}
+
+# Populate FEED_FILE from CLAYOK_FEED (URL or local file) or the default URL.
+# Returns non-zero on any failure, with details written to ERR_FILE.
+fetch_feed() {
+  local src="${CLAYOK_FEED:-$DEFAULT_URL}"
+  case "$src" in
+    http://*|https://*)
+      command -v curl >/dev/null 2>&1 || { printf "'curl' not found\n" >"$ERR_FILE"; return 1; }
+      curl --fail --location --silent --show-error --compressed \
+        --connect-timeout 10 --max-time 25 \
+        -H "User-Agent: $UA" \
+        -H "Accept: application/rss+xml, application/xml, text/xml, */*" \
+        "$src" -o "$FEED_FILE" 2>"$ERR_FILE" || return 1
+      ;;
+    *)
+      [ -f "$src" ] || { printf "feed file not found: %s\n" "$src" >"$ERR_FILE"; return 1; }
+      cat "$src" >"$FEED_FILE"
+      ;;
+  esac
+  [ -s "$FEED_FILE" ] || { printf "empty response from %s\n" "$src" >"$ERR_FILE"; return 1; }
+  xmllint --noout "$FEED_FILE" 2>>"$ERR_FILE" || return 1
+  return 0
+}
+
+# --- argument parsing ------------------------------------------------------
+
+validate_limit() {
+  case "$1" in
+    ''|*[!0-9]*) die 2 "clayok: invalid --limit '$1': must be a positive integer." ;;
+  esac
+  [ "$1" -ge 1 ] || die 2 "clayok: invalid --limit '$1': must be >= 1."
+}
+
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n|--limit)
+        [ $# -ge 2 ] || die 2 "clayok: option '$1' requires a positive integer argument."
+        validate_limit "$2"; LIMIT="$2"; shift 2 ;;
+      --limit=*)
+        LIMIT="${1#*=}"; validate_limit "$LIMIT"; shift ;;
+      -h|--help)    usage; exit 0 ;;
+      -v|--version) printf 'clayok %s\n' "$VERSION"; exit 0 ;;
+      --)           shift; break ;;
+      -*)           die 2 "clayok: unknown option '$1' (try --help)." ;;
+      *)            die 2 "clayok: unexpected argument '$1' (try --help)." ;;
+    esac
+  done
+  [ "$LIMIT" -le "$MAX_LIMIT" ] || { warn "clayok: capping --limit to $MAX_LIMIT."; LIMIT="$MAX_LIMIT"; }
+}
+
+# --- main ------------------------------------------------------------------
+
+main() {
+  parse_args "$@"
+  check_deps
+
+  FEED_FILE="$(mktemp)"; ERR_FILE="$(mktemp)"
+  trap cleanup EXIT
+
+  local src="${CLAYOK_FEED:-$DEFAULT_URL}"
+
+  if ! fetch_feed; then
+    warn "clayok: could not read the Clay status feed:"
+    sed 's/^/  /' "$ERR_FILE" >&2 2>/dev/null || true
+    printf '❔ Status unknown — could not read the status feed (%s)\n' "$src"
+    exit 2
+  fi
+
+  # --- parse the whole feed in a single awk pass into parallel arrays -------
+  local toks=() titles=() dates=() links=()
+  local tok title date link
+  while IFS=$'\t' read -r tok title date link; do
+    toks+=("$tok"); titles+=("$title"); dates+=("$date"); links+=("$link")
+  done < <(awk "$AWK_PARSE" "$FEED_FILE")
+
+  local n=${#toks[@]}
+  if [ "$n" -eq 0 ]; then
+    warn "clayok: the status feed contains no incident items."
+    printf '❔ Status unknown — the status feed is empty (%s)\n' "$src"
+    exit 2
+  fi
+
+  # --- scan every item (order-independent) for active/unknown states -------
+  local i=0 n_incident=0 n_maint=0 n_unknown=0
+  local active_lines="" upcoming_line=""
+  while [ "$i" -lt "$n" ]; do
+    tok="${toks[$i]}"
+    case "$tok" in
+      resolved|completed) : ;;
+      investigating|identified|monitoring)
+        n_incident=$(( n_incident + 1 )); append_active "$i" ;;
+      "in progress"|verifying)
+        n_maint=$(( n_maint + 1 )); append_active "$i" ;;
+      scheduled)
+        [ -z "$upcoming_line" ] && upcoming_line="${titles[$i]} ($(fmt_date "${dates[$i]}"))" ;;
+      "")
+        n_unknown=$(( n_unknown + 1 ))
+        warn "clayok: item $(( i + 1 )) has no recognizable status prefix; treating status as unknown." ;;
+      *)
+        n_unknown=$(( n_unknown + 1 ))
+        warn "clayok: item $(( i + 1 )) has an unrecognized status '[$tok]'; treating status as unknown." ;;
+    esac
+    i=$(( i + 1 ))
+  done
+
+  # --- derive overall state + exit code ------------------------------------
+  local state exit_code state_line
+  if [ "$n_incident" -gt 0 ]; then
+    state=incident; exit_code=1
+    state_line="$(printf '🔴 Active incident: %d open' "$n_incident")"
+  elif [ "$n_maint" -gt 0 ]; then
+    state=maintenance; exit_code=1
+    state_line="$(printf '🛠️  Maintenance in progress: %d ongoing' "$n_maint")"
+  elif [ "$n_unknown" -gt 0 ]; then
+    state=unknown; exit_code=2
+    state_line="❔ Status unknown — the feed contains entries clayok could not classify"
+  else
+    state=operational; exit_code=0
+    state_line="✅ No active incidents found in the status feed"
+  fi
+
+  # --- feed freshness ------------------------------------------------------
+  # Feed is ordered oldest-first, so the newest item is last. (Guarded by a
+  # fixture test; active-state detection above does NOT rely on ordering.)
+  local newest_raw newest_fmt freshness=""
+  newest_raw="${dates[$(( n - 1 ))]}"
+  if [ -n "$newest_raw" ]; then
+    newest_fmt="$(fmt_date "$newest_raw")"
+    local ne now days
+    ne="$(to_epoch "$newest_raw")"; now="$(date +%s 2>/dev/null || printf '')"
+    if [ -n "$ne" ] && [ -n "$now" ]; then
+      days=$(( ( now - ne ) / 86400 ))
+      if [ "$days" -lt 0 ]; then
+        freshness="Feed last updated: $newest_fmt"
+      elif [ "$days" -eq 0 ]; then
+        freshness="Feed last updated: $newest_fmt (today)"
+      else
+        freshness="Feed last updated: $newest_fmt ($days day(s) ago)"
+      fi
+      [ "$days" -gt 30 ] && freshness="$freshness  ⚠️  feed looks stale"
+    else
+      freshness="Feed last updated: $newest_fmt"
+    fi
+  fi
+
+  # --- render report (stdout only) -----------------------------------------
+  printf 'Clay status — checked %s\n' "$(date +"%Y-%m-%d %H:%M %Z")"
+  printf 'Source: %s\n\n' "$src"
+  printf '%s\n' "$state_line"
+  [ -n "$upcoming_line" ] && printf '   ℹ️  Upcoming maintenance scheduled: %s\n' "$upcoming_line"
+
+  if [ -n "$active_lines" ]; then
+    printf '\nActive:\n'
+    printf '%s' "$active_lines"
+  fi
+
+  # Recent incidents: last N items, newest first.
+  local start
+  start=$(( n - LIMIT )); [ "$start" -lt 0 ] && start=0
+  printf '\nRecent incidents (newest first):\n'
+  i=$(( n - 1 ))
+  while [ "$i" -ge "$start" ]; do
+    tok="${toks[$i]}"; [ -z "$tok" ] && tok="?"
+    icon_for "$tok"
+    printf '  %s  %-13s  %-10s  %s\n      %s\n' \
+      "$ICON" "$tok" "$(fmt_date "${dates[$i]}")" "${titles[$i]}" "${links[$i]}"
+    i=$(( i - 1 ))
+  done
+
+  [ -n "$freshness" ] && printf '\n%s\n' "$freshness"
+
+  exit "$exit_code"
+}
+
+# Append a formatted two-line entry for item index $1 to the global active_lines.
+append_active() {
+  local idx="$1"
+  icon_for "${toks[$idx]}"
+  active_lines="${active_lines}$(printf '  %s  %-13s  %-10s  %s\n      %s' \
+    "$ICON" "${toks[$idx]}" "$(fmt_date "${dates[$idx]}")" "${titles[$idx]}" "${links[$idx]}")"$'\n'
+}
+
+main "$@"

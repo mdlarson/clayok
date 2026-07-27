@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Clay - Incident History</title>
+    <description>Status Page</description>
+    <link>https://status.clay.com/history</link>
+    <item>
+      <title><![CDATA[Old Unresolved Incident]]></title>
+      <description><![CDATA[[Investigating] We are still looking into this.]]></description>
+      <pubDate>Mon, 01 Jan 2024 00:00:00 -0700</pubDate>
+      <link>https://status.clay.com/incidents/old</link>
+      <guid>https://status.clay.com/incidents/old</guid>
+    </item>
+    <item>
+      <title><![CDATA[A Newer, Resolved Incident]]></title>
+      <description><![CDATA[[Resolved] Everything is back to normal.]]></description>
+      <pubDate>Sat, 25 Jul 2026 18:00:00 -0700</pubDate>
+      <link>https://status.clay.com/incidents/new</link>
+      <guid>https://status.clay.com/incidents/new</guid>
+    </item>
+  </channel>
+</rss>

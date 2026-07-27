@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Clay - Incident History</title>
+    <!-- Newest-first ordering (opposite of Clay's live feed). Active detection
+         must still work because it scans every item regardless of order. -->
+    <item>
+      <title><![CDATA[Newest, and it is active]]></title>
+      <description><![CDATA[[Monitoring] Fix deployed, watching metrics.]]></description>
+      <pubDate>Sat, 25 Jul 2026 18:00:00 -0700</pubDate>
+      <link>https://status.clay.com/incidents/newest</link>
+    </item>
+    <item>
+      <title><![CDATA[Older, resolved]]></title>
+      <description><![CDATA[[Resolved] Closed out.]]></description>
+      <pubDate>Wed, 01 Jan 2025 00:00:00 -0700</pubDate>
+      <link>https://status.clay.com/incidents/older</link>
+    </item>
+  </channel>
+</rss>

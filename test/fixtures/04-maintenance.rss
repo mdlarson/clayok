@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Clay - Incident History</title>
+    <item>
+      <title><![CDATA[Old Resolved Thing]]></title>
+      <description><![CDATA[[Resolved] Done.]]></description>
+      <pubDate>Wed, 01 Jan 2025 00:00:00 -0700</pubDate>
+      <link>https://status.clay.com/incidents/old</link>
+    </item>
+    <item>
+      <title><![CDATA[Scheduled Maintenance]]></title>
+      <description><![CDATA[[In Progress] Maintenance is underway; brief interruptions expected.]]></description>
+      <pubDate>Sat, 25 Jul 2026 18:00:00 -0700</pubDate>
+      <link>https://status.clay.com/incidents/maint</link>
+    </item>
+  </channel>
+</rss>
