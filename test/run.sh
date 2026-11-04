@@ -54,6 +54,8 @@ run "operational baseline (scheduled fixture exits 0)"                     \
     03-scheduled.rss     0 "No active incidents found"
 
 echo
+. "$here/regressions.sh"
+
 echo "-----------------------------------------"
 printf 'Results: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

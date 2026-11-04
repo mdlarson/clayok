@@ -36,8 +36,9 @@ public RSS incident feed (`https://status.clay.com/history.rss`), so that's what
 ## Install
 
 `clayok` is a single Bash script (targets Bash 3.2, macOS's default). It needs
-only `curl`, `xmllint`, and `awk`, all of which are preinstalled on macOS.
-(On Debian/Ubuntu: `apt install curl libxml2-utils` — `awk` is already present.)
+`curl`, `xmllint`, `date`, and `sort`, plus standard shell utilities such as
+`mktemp`, all preinstalled on macOS.
+(On Debian/Ubuntu: `apt install curl libxml2-utils` — `date` and `sort` are provided by coreutils.)
 
 ```bash
 git clone https://github.com/mdlarson/clayok.git
@@ -112,6 +113,20 @@ newer than a still-open incident) and classifies it:
 - Unrecognized — anything else → treated as `unknown` (exit `2`), never silently
   assumed healthy
 
+Recent incidents and active entries are ordered by publication timestamp, newest
+first, regardless of feed order. The upcoming-maintenance note selects the most
+recently published scheduled entry. Equal timestamps retain their input order.
+Publication dates are parsed with Bash arithmetic, without per-item subprocesses.
+Supported dates use English month names, four-digit years, and numeric timezone
+offsets or standard UTC/GMT and US timezone abbreviations.
+Items with missing, unsupported, or invalid dates follow dated items in input order and display
+the original date text; date problems do not change lifecycle classification.
+Freshness uses the greatest valid publication timestamp and is omitted if none
+can be parsed.
+
+XML extraction uses `xmllint` XPath in batches of up to 50 items. CDATA and XML
+entities are decoded, whitespace is normalized, and missing fields remain empty.
+
 ## Limitations
 
 - The feed is incident history, not an authoritative component-status API.
@@ -131,7 +146,10 @@ bash test/run.sh
 The suite runs `clayok` against checked-in XML fixtures (via `CLAYOK_FEED`), so
 it needs no network. Cases cover order-independence, concurrent incidents,
 scheduled vs. in-progress maintenance, unknown tokens, empty/malformed feeds,
-XML entities in titles, and reversed feed ordering.
+CDATA and escaped XML entities, missing fields, chronological ordering and date
+fallbacks, multi-batch feeds, extraction failures, and active incidents beyond the
+recent display limit. The runner also checks output sections and diagnostics.
+Run it on macOS Bash 3.2 and Linux Bash when changing portability-sensitive code.
 
 ## License
 

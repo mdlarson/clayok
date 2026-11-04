@@ -6,7 +6,7 @@
 # runs on Rootly, which exposes no JSON API, so this reads the public RSS
 # incident feed instead and derives current status from it.
 #
-# Dependencies: curl + xmllint + awk (all preinstalled on macOS). Targets Bash 3.2.
+# Dependencies: curl + xmllint + date + sort (all preinstalled on macOS). Targets Bash 3.2.
 #
 # Exit codes:
 #   0  operational  — no active incidents found in the feed
@@ -21,39 +21,6 @@ DEFAULT_URL="https://status.clay.com/history.rss"
 UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 LIMIT=5
 MAX_LIMIT=50
-
-# One-pass RSS parser. Walks <item>…</item> blocks and prints, per item, a
-# single tab-separated line: "TOKEN<TAB>TITLE<TAB>PUBDATE<TAB>LINK", where
-# TOKEN is the leading [Status] of the description body ("" if none). Doing all
-# extraction in a single awk process (instead of one xmllint call per item)
-# keeps a 100+ item feed at a few milliseconds. Item boundaries are tracked
-# explicitly, so a missing field yields "" for that item without misaligning
-# the others.
-AWK_PARSE='
-function field(buf, tag,   o, c, rest, s, start, endp) {
-  o = "<" tag ">"; c = "</" tag ">"
-  start = index(buf, o); if (start == 0) return ""
-  rest = substr(buf, start + length(o))
-  endp = index(rest, c); if (endp == 0) return ""
-  s = substr(rest, 1, endp - 1)
-  gsub(/^[ \t]+|[ \t]+$/, "", s)                       # trim
-  if (s ~ /^<!\[CDATA\[/ && s ~ /\]\]>$/) s = substr(s, 10, length(s) - 12)  # unwrap CDATA
-  gsub(/^[ \t]+|[ \t]+$/, "", s)
-  return s
-}
-{
-  if ($0 ~ /<item>/) { initem = 1; buf = "" }
-  if (initem) buf = buf " " $0
-  if ($0 ~ /<\/item>/) {
-    initem = 0
-    d = field(buf, "description"); t = field(buf, "title")
-    p = field(buf, "pubDate");     l = field(buf, "link")
-    tok = ""
-    if (d ~ /^\[[^]]*\]/) tok = substr(d, 2, index(d, "]") - 2)
-    print tok "\t" t "\t" p "\t" l
-  }
-}
-'
 
 # --- small helpers ---------------------------------------------------------
 
@@ -106,7 +73,10 @@ icon_for() {
 # Format an RFC-822 pubDate as YYYY-MM-DD, fork-free (falls back to raw input).
 fmt_date() {
   local s="$1" dow day mon yr rest
-  read -r dow day mon yr rest <<< "$s"
+  case "$s" in
+    *,*) read -r dow day mon yr rest <<< "$s" ;;
+    *) read -r day mon yr rest <<< "$s" ;;
+  esac
   case "$mon" in
     Jan) mon=01 ;; Feb) mon=02 ;; Mar) mon=03 ;; Apr) mon=04 ;;
     May) mon=05 ;; Jun) mon=06 ;; Jul) mon=07 ;; Aug) mon=08 ;;
@@ -118,24 +88,76 @@ fmt_date() {
   printf '%s-%s-%s' "$yr" "$mon" "$day"
 }
 
-# Convert an RFC-822 pubDate to a Unix epoch (BSD or GNU date). "" on failure.
+# Parse RSS publication dates without spawning a process or subshell per item.
+# Return through EPOCH; unsupported or invalid dates retain the raw-date fallback.
+EPOCH=""
 to_epoch() {
-  local s="$1" e=""
-  e="$(date -j -f "%a, %d %b %Y %H:%M:%S %z" "$s" +%s 2>/dev/null)" || \
-  e="$(date -d "$s" +%s 2>/dev/null)" || e=""
-  printf '%s' "$e"
+  EPOCH=""
+  local input="$1" day mon year hour minute second zone extra offset sign
+  local days_in_month adjusted_year era year_of_era day_of_year days
+  # RSS dates use English month names and a numeric offset (or an RFC zone).
+  local pattern='^([A-Za-z]{3}, )?([0-9]{1,2}) ([A-Za-z]{3}) ([0-9]{4}) ([0-9]{2}):([0-9]{2})(:([0-9]{2}))? ([+-][0-9]{4}|[A-Za-z]{1,3})$'
+  [[ "$input" =~ $pattern ]] || return 0
+  day=$((10#${BASH_REMATCH[2]})); mon="${BASH_REMATCH[3]}"
+  year=$((10#${BASH_REMATCH[4]})); hour=$((10#${BASH_REMATCH[5]}))
+  minute=$((10#${BASH_REMATCH[6]})); second="${BASH_REMATCH[8]:-00}"
+  second=$((10#$second)); zone="${BASH_REMATCH[9]}"
+  case "$mon" in
+    Jan) mon=1 ;; Feb) mon=2 ;; Mar) mon=3 ;; Apr) mon=4 ;;
+    May) mon=5 ;; Jun) mon=6 ;; Jul) mon=7 ;; Aug) mon=8 ;;
+    Sep) mon=9 ;; Oct) mon=10 ;; Nov) mon=11 ;; Dec) mon=12 ;;
+    *) return 0 ;;
+  esac
+  [ "$year" -ge 1 ] && [ "$hour" -le 23 ] && [ "$minute" -le 59 ] && [ "$second" -le 59 ] || return 0
+  case "$mon" in
+    4|6|9|11) days_in_month=30 ;;
+    2)
+      days_in_month=28
+      if (( year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) )); then days_in_month=29; fi ;;
+    *) days_in_month=31 ;;
+  esac
+  [ "$day" -ge 1 ] && [ "$day" -le "$days_in_month" ] || return 0
+  case "$zone" in
+    UT|UTC|GMT|Z) offset=0 ;;
+    EST) offset=-18000 ;; EDT) offset=-14400 ;;
+    CST) offset=-21600 ;; CDT) offset=-18000 ;;
+    MST) offset=-25200 ;; MDT) offset=-21600 ;;
+    PST) offset=-28800 ;; PDT) offset=-25200 ;;
+    [+-]*)
+      sign="${zone:0:1}"
+      offset=$((10#${zone:1:2})); extra=$((10#${zone:3:2}))
+      [ "$offset" -le 23 ] && [ "$extra" -le 59 ] || return 0
+      offset=$((offset * 3600 + extra * 60))
+      [ "$sign" != - ] || offset=$((-offset)) ;;
+    *) return 0 ;;
+  esac
+  # Gregorian civil date to days since 1970-01-01, with March as month zero.
+  adjusted_year=$year
+  if [ "$mon" -le 2 ]; then adjusted_year=$((year - 1)); mon=$((mon + 12)); fi
+  era=$((adjusted_year / 400)); year_of_era=$((adjusted_year - era * 400))
+  day_of_year=$(((153 * (mon - 3) + 2) / 5 + day - 1))
+  days=$((era * 146097 + year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year - 719468))
+  EPOCH=$((days * 86400 + hour * 3600 + minute * 60 + second - offset))
 }
 
 # --- feed access -----------------------------------------------------------
 
 FEED_FILE=""
 ERR_FILE=""
-cleanup() { [ -n "$FEED_FILE" ] && rm -f "$FEED_FILE" "$ERR_FILE" 2>/dev/null || true; }
+PARSED_FILE=""
+ORDER_FILE=""
+cleanup() {
+  local f
+  for f in "$FEED_FILE" "$ERR_FILE" "$PARSED_FILE" "$ORDER_FILE"; do
+    [ -z "$f" ] || rm -f "$f" 2>/dev/null || true
+  done
+}
 
 check_deps() {
   command -v xmllint >/dev/null 2>&1 || \
     die 2 "clayok: 'xmllint' not found. Install libxml2 (preinstalled on macOS; 'apt install libxml2-utils' on Debian/Ubuntu)."
-  command -v awk >/dev/null 2>&1 || die 2 "clayok: 'awk' not found."
+  command -v date >/dev/null 2>&1 || die 2 "clayok: 'date' not found."
+  command -v sort >/dev/null 2>&1 || die 2 "clayok: 'sort' not found."
 }
 
 # Populate FEED_FILE from CLAYOK_FEED (URL or local file) or the default URL.
@@ -157,8 +179,50 @@ fetch_feed() {
       ;;
   esac
   [ -s "$FEED_FILE" ] || { printf "empty response from %s\n" "$src" >"$ERR_FILE"; return 1; }
-  xmllint --noout "$FEED_FILE" 2>>"$ERR_FILE" || return 1
+  xmllint --nonet --noout "$FEED_FILE" 2>>"$ERR_FILE" || return 1
   return 0
+}
+
+# XPath returns decoded, whitespace-normalized fields, one per line. XML
+# whitespace cannot survive normalize-space(), so empty lines are unambiguous.
+extract_feed() {
+  local count first last i field xpath sep
+  count="$(xmllint --nonet --xpath 'count(/rss/channel/item)' "$FEED_FILE" 2>>"$ERR_FILE")" || return 1
+  case "$count" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$count" -gt 0 ] || { printf 'the status feed contains no incident items\n' >>"$ERR_FILE"; return 1; }
+  : >"$PARSED_FILE"
+  first=1
+  while [ "$first" -le "$count" ]; do
+    last=$(( first + 49 )); [ "$last" -le "$count" ] || last="$count"
+    xpath="concat("; sep=""; i="$first"
+    while [ "$i" -le "$last" ]; do
+      for field in title description pubDate link; do
+        xpath="${xpath}${sep}normalize-space(string(/rss/channel/item[$i]/$field)), '
+'"
+        sep=", "
+      done
+      i=$(( i + 1 ))
+    done
+    xpath="${xpath})"
+    # xmllint versions differ in whether they append a result newline. Read
+    # exactly the expected field count from each successful batch below.
+    xmllint --nonet --xpath "$xpath" "$FEED_FILE" >"$ORDER_FILE" 2>>"$ERR_FILE" || return 1
+    i=$(( (last - first + 1) * 4 ))
+    local line
+    while [ "$i" -gt 0 ]; do
+      IFS= read -r line || { printf 'incomplete extracted incident record\n' >>"$ERR_FILE"; return 1; }
+      printf '%s\n' "$line"
+      i=$(( i - 1 ))
+    done <"$ORDER_FILE" >>"$PARSED_FILE"
+    first=$(( last + 1 ))
+  done
+}
+
+feed_error() {
+  warn "clayok: could not read the Clay status feed:"
+  sed 's/^/  /' "$ERR_FILE" >&2 2>/dev/null || true
+  printf '❔ Status unknown — could not read the status feed (%s)\n' "${CLAYOK_FEED:-$DEFAULT_URL}"
+  exit 2
 }
 
 # --- argument parsing ------------------------------------------------------
@@ -194,45 +258,46 @@ main() {
   parse_args "$@"
   check_deps
 
-  FEED_FILE="$(mktemp)"; ERR_FILE="$(mktemp)"
   trap cleanup EXIT
-
+  FEED_FILE="$(mktemp)"; ERR_FILE="$(mktemp)"
+  PARSED_FILE="$(mktemp)"; ORDER_FILE="$(mktemp)"
   local src="${CLAYOK_FEED:-$DEFAULT_URL}"
+  fetch_feed && extract_feed || feed_error
 
-  if ! fetch_feed; then
-    warn "clayok: could not read the Clay status feed:"
-    sed 's/^/  /' "$ERR_FILE" >&2 2>/dev/null || true
-    printf '❔ Status unknown — could not read the status feed (%s)\n' "$src"
-    exit 2
-  fi
-
-  # --- parse the whole feed in a single awk pass into parallel arrays -------
-  local toks=() titles=() dates=() links=()
-  local tok title date link
-  while IFS=$'\t' read -r tok title date link; do
+  local toks=() titles=() dates=() links=() epochs=() order=() active=()
+  local tok title description date link epoch idx valid
+  : >"$ORDER_FILE"
+  while IFS= read -r title; do
+    IFS= read -r description && IFS= read -r date && IFS= read -r link || feed_error
+    tok=""
+    case "$description" in
+      \[*\]*) tok="${description#\[}"; tok="${tok%%\]*}" ;;
+    esac
+    idx=${#toks[@]}
     toks+=("$tok"); titles+=("$title"); dates+=("$date"); links+=("$link")
-  done < <(awk "$AWK_PARSE" "$FEED_FILE")
-
+    to_epoch "$date"
+    epoch="$EPOCH"
+    epochs+=("$epoch")
+    valid=1; [ -z "$epoch" ] || valid=0
+    printf '%s %s %s\n' "$valid" "${epoch:-0}" "$idx" >>"$ORDER_FILE"
+  done <"$PARSED_FILE"
   local n=${#toks[@]}
-  if [ "$n" -eq 0 ]; then
-    warn "clayok: the status feed contains no incident items."
-    printf '❔ Status unknown — the status feed is empty (%s)\n' "$src"
-    exit 2
-  fi
+  LC_ALL=C sort -k1,1n -k2,2nr -k3,3n "$ORDER_FILE" >"$PARSED_FILE" || feed_error
+  while read -r valid epoch idx; do order+=("$idx"); done <"$PARSED_FILE"
 
   # --- scan every item (order-independent) for active/unknown states -------
   local i=0 n_incident=0 n_maint=0 n_unknown=0
-  local active_lines="" upcoming_line=""
-  while [ "$i" -lt "$n" ]; do
+  local upcoming_line=""
+  for i in "${order[@]}"; do
     tok="${toks[$i]}"
     case "$tok" in
       resolved|completed) : ;;
       investigating|identified|monitoring)
-        n_incident=$(( n_incident + 1 )); append_active "$i" ;;
+        n_incident=$(( n_incident + 1 )); active+=("$i") ;;
       "in progress"|verifying)
-        n_maint=$(( n_maint + 1 )); append_active "$i" ;;
+        n_maint=$(( n_maint + 1 )); active+=("$i") ;;
       scheduled)
-        [ -z "$upcoming_line" ] && upcoming_line="${titles[$i]} ($(fmt_date "${dates[$i]}"))" ;;
+        [ -z "$upcoming_line" ] && upcoming_line="${titles[$i]} ($(item_date "$i"))" ;;
       "")
         n_unknown=$(( n_unknown + 1 ))
         warn "clayok: item $(( i + 1 )) has no recognizable status prefix; treating status as unknown." ;;
@@ -240,34 +305,33 @@ main() {
         n_unknown=$(( n_unknown + 1 ))
         warn "clayok: item $(( i + 1 )) has an unrecognized status '[$tok]'; treating status as unknown." ;;
     esac
-    i=$(( i + 1 ))
   done
 
   # --- derive overall state + exit code ------------------------------------
-  local state exit_code state_line
+  local exit_code state_line
   if [ "$n_incident" -gt 0 ]; then
-    state=incident; exit_code=1
+    exit_code=1
     state_line="$(printf '🔴 Active incident: %d open' "$n_incident")"
   elif [ "$n_maint" -gt 0 ]; then
-    state=maintenance; exit_code=1
+    exit_code=1
     state_line="$(printf '🛠️  Maintenance in progress: %d ongoing' "$n_maint")"
   elif [ "$n_unknown" -gt 0 ]; then
-    state=unknown; exit_code=2
+    exit_code=2
     state_line="❔ Status unknown — the feed contains entries clayok could not classify"
   else
-    state=operational; exit_code=0
+    exit_code=0
     state_line="✅ No active incidents found in the status feed"
   fi
 
   # --- feed freshness ------------------------------------------------------
-  # Feed is ordered oldest-first, so the newest item is last. (Guarded by a
-  # fixture test; active-state detection above does NOT rely on ordering.)
+  # The first dated item is newest, independent of feed order.
   local newest_raw newest_fmt freshness=""
-  newest_raw="${dates[$(( n - 1 ))]}"
-  if [ -n "$newest_raw" ]; then
+  idx="${order[0]}"
+  newest_raw="${dates[$idx]}"
+  if [ -n "${epochs[$idx]}" ]; then
     newest_fmt="$(fmt_date "$newest_raw")"
     local ne now days
-    ne="$(to_epoch "$newest_raw")"; now="$(date +%s 2>/dev/null || printf '')"
+    ne="${epochs[$idx]}"; now="$(date +%s 2>/dev/null || printf '')"
     if [ -n "$ne" ] && [ -n "$now" ]; then
       days=$(( ( now - ne ) / 86400 ))
       if [ "$days" -lt 0 ]; then
@@ -289,22 +353,16 @@ main() {
   printf '%s\n' "$state_line"
   [ -n "$upcoming_line" ] && printf '   ℹ️  Upcoming maintenance scheduled: %s\n' "$upcoming_line"
 
-  if [ -n "$active_lines" ]; then
+  if [ "${#active[@]}" -gt 0 ]; then
     printf '\nActive:\n'
-    printf '%s' "$active_lines"
+    for i in "${active[@]}"; do render_entry "$i"; done
   fi
 
-  # Recent incidents: last N items, newest first.
-  local start
-  start=$(( n - LIMIT )); [ "$start" -lt 0 ] && start=0
   printf '\nRecent incidents (newest first):\n'
-  i=$(( n - 1 ))
-  while [ "$i" -ge "$start" ]; do
-    tok="${toks[$i]}"; [ -z "$tok" ] && tok="?"
-    icon_for "$tok"
-    printf '  %s  %-13s  %-10s  %s\n      %s\n' \
-      "$ICON" "$tok" "$(fmt_date "${dates[$i]}")" "${titles[$i]}" "${links[$i]}"
-    i=$(( i - 1 ))
+  local pos=0
+  while [ "$pos" -lt "$n" ] && [ "$pos" -lt "$LIMIT" ]; do
+    render_entry "${order[$pos]}"
+    pos=$(( pos + 1 ))
   done
 
   [ -n "$freshness" ] && printf '\n%s\n' "$freshness"
@@ -312,12 +370,20 @@ main() {
   exit "$exit_code"
 }
 
-# Append a formatted two-line entry for item index $1 to the global active_lines.
-append_active() {
-  local idx="$1"
-  icon_for "${toks[$idx]}"
-  active_lines="${active_lines}$(printf '  %s  %-13s  %-10s  %s\n      %s' \
-    "$ICON" "${toks[$idx]}" "$(fmt_date "${dates[$idx]}")" "${titles[$idx]}" "${links[$idx]}")"$'\n'
+item_date() {
+  if [ -n "${epochs[$1]}" ]; then
+    fmt_date "${dates[$1]}"
+  else
+    printf '%s' "${dates[$1]}"
+  fi
+}
+
+# Render either an active or recent item using the same layout.
+render_entry() {
+  local idx="$1" token="${toks[$1]:-?}"
+  icon_for "$token"
+  printf '  %s  %-13s  %-10s  %s\n      %s\n' \
+    "$ICON" "$token" "$(item_date "$idx")" "${titles[$idx]}" "${links[$idx]}"
 }
 
 main "$@"
